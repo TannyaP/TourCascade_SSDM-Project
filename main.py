@@ -1,87 +1,311 @@
-from pathlib import Path
-from src.config import (
-    RAW_DATA_PATH, RESULTS_DIR, FIGURES_DIR,
-    H3_RESOLUTION, MAX_SESSION_GAP_HOURS, MIN_SUPPORT, MIN_CONFIDENCE
-)
-from src.preprocessing import load_data, clean_data, classify_category, create_sessions
-from src.spatial import assign_h3
-from src.cascades import build_cascades
-from src.mining import mine_sequential_patterns
-from src.centrality import build_cascade_graph, calculate_sequential_centrality
-from src.baselines import extract_zone_features, identify_hidden_hotspots
-from src.visualization import export_visualizations
-from src.validation import explain_zone
+"""
+TourCascade - Temporal Validation and Explainability
+"""
 
-def main():
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+import numpy as np
+import pandas as pd
 
-    # 1. Ingestion & Spatial Preprocessing
-    print("[1/6] Loading and cleaning check-in data...")
-    df = load_data(RAW_DATA_PATH)
-    print(f"       Raw records: {len(df)}")
-    
-    df = clean_data(df)
-    print(f"       Records after clean & NYC bounds: {len(df)}")
 
-    df["category_group"] = df["category"].apply(classify_category)
-    print(f"       Category breakdown:\n{df['category_group'].value_counts().to_string()}")
+def chronological_split(
+    df,
+    test_fraction=0.30,
+):
+    """
+    Split mobility data chronologically.
 
-    df = create_sessions(df, max_gap_hours=MAX_SESSION_GAP_HOURS)
-    print(f"       Unique sessions created: {df['session_id'].nunique()}")
+    The first (1-test_fraction) is training data.
+    The final test_fraction is test data.
+    """
 
-    df = assign_h3(df, resolution=H3_RESOLUTION)
-    print(f"       Unique H3 zones: {df['zone_id'].nunique()}")
+    if df.empty:
+        return df.copy(), df.copy()
 
-   # 2. Extract Mobility Cascades
-    print("[2/6] Building tourist mobility cascades...")
-    zone_features = extract_zone_features(df)
-    cascades = build_cascades(df)
-    print(f"       Total cascades constructed (length >= 2): {len(cascades)}")
-    
-    if len(cascades) == 0:
-        print("\n[!] FATAL: 0 cascades were formed. Checking sample data...")
-        print(df[["user_id", "session_id", "timestamp", "zone_id"]].head(10))
+    data = df.sort_values(
+        "timestamp"
+    ).copy()
+
+    split_index = int(
+        len(data) * (1 - test_fraction)
+    )
+
+    train = data.iloc[:split_index].copy()
+    test = data.iloc[split_index:].copy()
+
+    return train, test
+
+
+def calculate_future_activity(
+    test_df,
+):
+    """
+    Calculate future activity for every zone.
+    """
+
+    if test_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "zone_id",
+                "future_visits",
+                "future_users",
+            ]
+        )
+
+    result = (
+        test_df.groupby("zone_id")
+        .agg(
+            future_visits=("zone_id", "size"),
+            future_users=("user_id", "nunique"),
+        )
+        .reset_index()
+    )
+
+    result["zone_id"] = (
+        result["zone_id"]
+        .astype(str)
+    )
+
+    return result
+
+
+def precision_at_k(
+    predicted_zones,
+    actual_zones,
+    k,
+):
+    """
+    Precision@K.
+    """
+
+    predicted = list(predicted_zones)[:k]
+    actual = set(actual_zones)
+
+    if not predicted:
+        return 0.0
+
+    hits = sum(
+        1
+        for zone in predicted
+        if zone in actual
+    )
+
+    return hits / len(predicted)
+
+
+def recall_at_k(
+    predicted_zones,
+    actual_zones,
+    k,
+):
+    """
+    Recall@K.
+    """
+
+    predicted = list(predicted_zones)[:k]
+    actual = set(actual_zones)
+
+    if not actual:
+        return 0.0
+
+    hits = sum(
+        1
+        for zone in predicted
+        if zone in actual
+    )
+
+    return hits / len(actual)
+
+
+def validate_predictions(
+    ranking,
+    future_activity,
+    ks=(5, 10, 20),
+):
+    """
+    Compare Sequential Centrality rankings with
+    future activity.
+
+    Actual future hotspots are defined as the top zones
+    by future visit count.
+    """
+
+    if ranking.empty or future_activity.empty:
+        return pd.DataFrame()
+
+    merged = ranking.merge(
+        future_activity,
+        on="zone_id",
+        how="left",
+    )
+
+    merged["future_visits"] = (
+        merged["future_visits"]
+        .fillna(0)
+    )
+
+    # Top 20% future zones as actual hotspots
+    threshold = merged[
+        "future_visits"
+    ].quantile(0.80)
+
+    actual_hotspots = set(
+        merged.loc[
+            merged["future_visits"] >= threshold,
+            "zone_id",
+        ]
+    )
+
+    predicted = merged.sort_values(
+        "sequential_centrality",
+        ascending=False,
+    )["zone_id"].tolist()
+
+    rows = []
+
+    for k in ks:
+
+        rows.append(
+            {
+                "k": k,
+                "precision_at_k": precision_at_k(
+                    predicted,
+                    actual_hotspots,
+                    k,
+                ),
+                "recall_at_k": recall_at_k(
+                    predicted,
+                    actual_hotspots,
+                    k,
+                ),
+                "actual_hotspot_count": len(
+                    actual_hotspots
+                ),
+            }
+        )
+
+    # Spearman-style rank correlation
+    rank_data = merged[
+        [
+            "sequential_centrality",
+            "future_visits",
+        ]
+    ].copy()
+
+    rank_data["sc_rank"] = (
+        rank_data["sequential_centrality"]
+        .rank(
+            ascending=False,
+            method="average",
+        )
+    )
+
+    rank_data["future_rank"] = (
+        rank_data["future_visits"]
+        .rank(
+            ascending=False,
+            method="average",
+        )
+    )
+
+    correlation = (
+        rank_data[
+            ["sc_rank", "future_rank"]
+        ]
+        .corr()
+        .iloc[0, 1]
+    )
+
+    for row in rows:
+        row["spearman_correlation"] = correlation
+
+    return pd.DataFrame(rows)
+
+
+def explain_zone(
+    zone_id,
+    patterns,
+    centrality=None,
+    top_n=5,
+):
+    """
+    Return the strongest sequential patterns ending
+    at the selected zone.
+    """
+
+    if patterns is None or patterns.empty:
+        print(
+            f"No sequential patterns available for zone {zone_id}."
+        )
         return
 
-    # 3. Constrained Pattern Mining
-    print("[3/6] Mining sequential transition patterns...")
-    patterns = mine_sequential_patterns(cascades, min_support=MIN_SUPPORT, min_confidence=MIN_CONFIDENCE)
-    print(f"       Mined patterns above thresholds: {len(patterns)}")
+    zone_id = str(zone_id)
 
-    if len(patterns) == 0:
-        print("\n[!] FATAL: 0 patterns mined. Thresholds (min_support / min_confidence) are still too high, or transitions are being pruned.")
+    candidates = patterns[
+        patterns["target_zone"].astype(str)
+        == zone_id
+    ].copy()
+
+    if candidates.empty:
+        print(
+            f"No supporting cascade found for zone {zone_id}."
+        )
         return
 
-    # 4. Graph Construction & Centrality Computation
-    print("[4/6] Building graph and scoring Sequential Centrality...")
-    G = build_cascade_graph(patterns)
-    print(f"       Graph Nodes: {G.number_of_nodes()}, Edges: {G.number_of_edges()}")
+    candidates = candidates.sort_values(
+        [
+            "confidence",
+            "support",
+        ],
+        ascending=False,
+    ).head(top_n)
 
-    centrality = calculate_sequential_centrality(G)
-    centrality["zone_id"] = centrality["zone_id"].astype(str)
-    zone_features["zone_id"] = zone_features["zone_id"].astype(str)
+    print(
+        f"\nWhy is zone {zone_id} recommended?"
+    )
 
-    final_ranking = centrality.merge(zone_features, on="zone_id", how="left")
-    hidden_hotspots = identify_hidden_hotspots(final_ranking)
+    if centrality is not None:
 
-    # 5. Persist Results
-    print("[5/6] Exporting tables and visual assets...")
-    final_ranking.to_csv(RESULTS_DIR / "final_zone_ranking.csv", index=False)
-    patterns.to_csv(RESULTS_DIR / "mined_sequential_patterns.csv", index=False)
-    hidden_hotspots.to_csv(RESULTS_DIR / "hidden_hotspots.csv", index=False)
-    export_visualizations(final_ranking, df, FIGURES_DIR)
+        row = centrality[
+            centrality["zone_id"].astype(str)
+            == zone_id
+        ]
 
-    # 6. Terminal Summary and Interpretability Demo
-    print("[6/6] Execution complete.\n")
-    display_cols = ["zone_id", "sequential_centrality", "visits", "downstream_count"]
-    print("Top Candidate Zones:")
-    print(final_ranking[display_cols].head(10).to_string(index=False))
+        if not row.empty:
 
-    if not final_ranking.empty:
-        top_zone = str(final_ranking.iloc[0]["zone_id"])
-        print("\nInterpretability Demo for Top Ranked Zone:")
-        explain_zone(top_zone, patterns, centrality)
+            score = row.iloc[0][
+                "sequential_centrality"
+            ]
 
-if __name__ == "__main__":
-    main()
+            print(
+                f"Sequential Centrality: {score:.4f}"
+            )
+
+    print("\nSupporting tourist sequences:")
+
+    for i, (_, row) in enumerate(
+        candidates.iterrows(),
+        start=1,
+    ):
+
+        print(
+            f"{i}. {row['pattern']}"
+        )
+
+        print(
+            f"   Support: "
+            f"{row['support']:.2%}"
+        )
+
+        print(
+            f"   Confidence: "
+            f"{row['confidence']:.2%}"
+        )
+
+    print(
+        "\nInterpretation:"
+    )
+
+    print(
+        "This zone repeatedly appears as a "
+        "downstream destination in tourist "
+        "mobility sequences."
+    )
