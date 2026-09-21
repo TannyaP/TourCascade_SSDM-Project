@@ -626,20 +626,6 @@ Future extensions can include:
 
 ---
 
-# 📚 Academic Context
-
-**Course:** CSE3068 — Sequential Spatial Data Mining (SSDM)
-**Project:** TourCascade
-**Research Area:** Sequential Spatial Data Mining
-**Application Domain:** Luxury Retail & Tourism Analytics
-**Student:** Tannya Pasricha
-**Register Number:** 23MIA1130
-**Institution:** VIT Chennai
-
-The original project proposal defines TourCascade as **“Sequential Spatial Mining of Tourist Mobility Cascades for Predictive Luxury Flagship Placement.”**
-
----
-
 ## ⭐ Project Summary
 
 > **TourCascade explores whether the way tourists move through a city can reveal where luxury retail opportunities may emerge next.**
